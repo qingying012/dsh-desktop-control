@@ -1,0 +1,5 @@
+# dsh bundle layer: mount the desktop-control tool.
+# Loaded by DeepSeek Harness from package.json's dsh.bundle manifest.
+- insert:
+    - id: dsh-desktop-control
+      name: dsh-desktop-control

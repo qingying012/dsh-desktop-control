@@ -1,0 +1,53 @@
+{
+  "name": "dsh-desktop-control",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness plugin: a desktop tool that screenshots the Windows screen and drives the mouse and keyboard.",
+  "author": "qingying012",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/qingying012/dsh-desktop-control.git"
+  },
+  "homepage": "https://github.com/qingying012/dsh-desktop-control#readme",
+  "bugs": {
+    "url": "https://github.com/qingying012/dsh-desktop-control/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "desktop",
+    "screenshot",
+    "mouse",
+    "keyboard",
+    "automation",
+    "windows"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./dsh/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dsh",
+    "assets",
+    "scripts",
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh.md"
+  ],
+  "scripts": {
+    "selftest": "node scripts/selftest.mjs"
+  },
+  "os": [
+    "win32"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
