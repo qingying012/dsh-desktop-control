@@ -1,7 +1,7 @@
 {
   "name": "dsh-desktop-control",
-  "version": "0.1.0",
-  "description": "DeepSeek Harness plugin: a desktop tool that screenshots the Windows screen and drives the mouse and keyboard.",
+  "version": "0.1.1",
+  "description": "DeepSeek Harness plugin: a desktop tool that screenshots the Windows screen (labelled coordinate grid), reads UI Automation and OCR, and drives the mouse and keyboard.",
   "author": "qingying012",
   "repository": {
     "type": "git",

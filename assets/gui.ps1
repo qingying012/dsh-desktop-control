@@ -7,6 +7,13 @@
     .\gui.ps1 shot out.png -window "记事本"   截指定窗口
     .\gui.ps1 shot out.png -region 0,0,800,600
     .\gui.ps1 shot out.png -cursor           截图并标出光标位置
+    .\gui.ps1 shot out.png -grid             叠加坐标网格与刻度标签
+    .\gui.ps1 shot out.png -maxwidth 1440    按长边缩放并返回 scale（坐标换算用）
+    .\gui.ps1 elements                       枚举前台窗口的 UIA 控件（名称 + 中心坐标）
+    .\gui.ps1 elements -window "记事本" -filter 保存
+    .\gui.ps1 ocr shot.png                   本地 OCR：文字 + 每行外框坐标
+    .\gui.ps1 click -uia "保存"              按控件名称点击（UIA 定位，不用算坐标）
+    .\gui.ps1 seq -file ops.json             一个进程内顺序执行多个动作
     .\gui.ps1 pos                            打印光标当前坐标
     .\gui.ps1 move 800 500                   移动光标
     .\gui.ps1 click 800 500                  左键单击
@@ -291,6 +298,101 @@ public class GuiNative
 
 [GuiNative]::EnableDpiAwareness()
 
+# ---- UI Automation：只在 elements / click -uia 时才编译，普通截图不付这份开销 ----
+function Initialize-Uia {
+    if ('UiaNative' -as [type]) { return }
+    Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, WindowsBase
+    $refs = @(
+        [System.Windows.Automation.AutomationElement].Assembly.Location,
+        [System.Windows.Automation.ControlType].Assembly.Location,
+        [System.Windows.Rect].Assembly.Location
+    ) | Select-Object -Unique
+    Add-Type -ReferencedAssemblies $refs -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Windows.Automation;
+
+public class UiaRow
+{
+    public int X, Y, W, H, Depth;
+    public string Type = "";
+    public string Name = "";
+    public string Id = "";
+    public bool Enabled;
+    public bool Invokable;
+}
+
+public class UiaNative
+{
+    public static List<UiaRow> Walk(IntPtr hwnd, int maxNodes, int maxDepth)
+    {
+        List<UiaRow> list = new List<UiaRow>();
+        AutomationElement root = AutomationElement.FromHandle(hwnd);
+        if (root == null) return list;
+        WalkRec(root, 0, maxNodes, maxDepth, list);
+        return list;
+    }
+
+    static void WalkRec(AutomationElement el, int depth, int maxNodes, int maxDepth, List<UiaRow> list)
+    {
+        if (list.Count >= maxNodes) return;
+        string type = "";
+        string name = "";
+        string aid = "";
+        System.Windows.Rect r = System.Windows.Rect.Empty;
+        bool enabled = false;
+        bool invokable = false;
+        try
+        {
+            object ct = el.GetCurrentPropertyValue(AutomationElement.ControlTypeProperty);
+            if (ct is ControlType) type = ((ControlType)ct).ProgrammaticName.Replace("ControlType.", "");
+            name = el.Current.Name ?? "";
+            aid = el.Current.AutomationId ?? "";
+            r = el.Current.BoundingRectangle;
+            enabled = el.Current.IsEnabled;
+        }
+        catch { return; }
+
+        if (!r.IsEmpty && r.Width >= 1 && r.Height >= 1)
+        {
+            try { invokable = el.GetCurrentPattern(InvokePattern.Pattern) != null; }
+            catch { invokable = false; }
+            UiaRow row = new UiaRow();
+            row.X = (int)r.X; row.Y = (int)r.Y;
+            row.W = (int)r.Width; row.H = (int)r.Height;
+            row.Depth = depth; row.Type = type; row.Name = name; row.Id = aid;
+            row.Enabled = enabled; row.Invokable = invokable;
+            list.Add(row);
+        }
+
+        if (depth >= maxDepth || list.Count >= maxNodes) return;
+        TreeWalker tw = TreeWalker.RawViewWalker;
+        AutomationElement child = tw.GetFirstChild(el);
+        while (child != null)
+        {
+            WalkRec(child, depth + 1, maxNodes, maxDepth, list);
+            if (list.Count >= maxNodes) break;
+            child = tw.GetNextSibling(child);
+        }
+    }
+
+    public static bool InvokeAt(int x, int y)
+    {
+        try
+        {
+            AutomationElement el = AutomationElement.FromPoint(new System.Windows.Point(x, y));
+            if (el == null) return false;
+            object pat = el.GetCurrentPattern(InvokePattern.Pattern);
+            if (pat == null) return false;
+            ((InvokePattern)pat).Invoke();
+            return true;
+        }
+        catch { return false; }
+    }
+}
+'@
+}
+
 # ---- 参数解析：位置参数 + -name value ----
 $pos = New-Object System.Collections.ArrayList
 $opt = @{}
@@ -324,12 +426,19 @@ function Get-RectFromString([string]$s) {
     @{ X = [int]$p[0]; Y = [int]$p[1]; W = [int]$p[2]; H = [int]$p[3] }
 }
 
+function Invoke-GuiCmd {
+    param($cmd, $rest, $opt)
+
 switch ($cmd) {
 
     'windows' {
         $rows = [GuiNative]::ListWindows()
+        $limit = if ($opt.ContainsKey('top')) { [int]$opt['top'] } else { 0 }
         "{0,-14} {1,-10} {2,-26} {3}" -f 'HWND', 'PID', 'RECT', 'TITLE'
+        $shown = 0
         foreach ($row in $rows) {
+            if ($limit -gt 0 -and $shown -ge $limit) { break }
+            $shown++
             $p = $row -split "`t"
             $hw = [long]$p[0]
             "{0,-14} {1,-10} {2,-26} {3}" -f ('0x' + $hw.ToString('X')), $p[6], ("{0},{1} {2}x{3}" -f $p[2], $p[3], $p[4], $p[5]), ($p[1] + "  [" + $p[7] + "]")
@@ -390,33 +499,101 @@ switch ($cmd) {
             }
             finally { $g.Dispose() }
 
-            if ($opt.ContainsKey('cursor')) {
-                $pt = [GuiNative]::Cursor()
-                $cx = $pt.X - $x; $cy = $pt.Y - $y
-                if ($cx -ge 0 -and $cy -ge 0 -and $cx -lt $width -and $cy -lt $height) {
-                    $g2 = [System.Drawing.Graphics]::FromImage($bmp)
+            # ---- 可选缩放：长边压到 -maxwidth 以内，返回 scale 供模型换算物理坐标 ----
+            $scale = 1.0
+            $maxW = if ($opt.ContainsKey('maxwidth')) { [int]$opt['maxwidth'] } else { 0 }
+            if ($maxW -gt 0 -and $width -gt $maxW) {
+                $scale = [double]$maxW / [double]$width
+                $nw = [int][Math]::Max(1, [Math]::Round($width * $scale))
+                $nh = [int][Math]::Max(1, [Math]::Round($height * $scale))
+                $small = New-Object System.Drawing.Bitmap $nw, $nh
+                $gs = [System.Drawing.Graphics]::FromImage($small)
+                try {
+                    $gs.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+                    $gs.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+                    $gs.DrawImage($bmp, 0, 0, $nw, $nh)
+                }
+                finally { $gs.Dispose() }
+                $bmp.Dispose()
+                $bmp = $small
+            }
+            $outW = $bmp.Width
+            $outH = $bmp.Height
+
+            $gridStep = 0
+            $g2 = [System.Drawing.Graphics]::FromImage($bmp)
+            try {
+                $g2.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+
+                # ---- 坐标网格：线上带物理坐标刻度，模型不用目测 ----
+                if ($opt.ContainsKey('grid')) {
+                    $gridStep = if ($opt.ContainsKey('gridstep')) { [int]$opt['gridstep'] } else { 100 }
+                    if ($gridStep -lt 20) { $gridStep = 100 }
+                    while ($gridStep * $scale -lt 56) { $gridStep *= 2 }
+
+                    $linePen = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(110, 0, 120, 235)), 1
+                    $fontSize = [float][Math]::Max(9.0, 10.0 * [Math]::Max($scale, 0.85))
+                    $font = New-Object System.Drawing.Font 'Consolas', $fontSize, ([System.Drawing.FontStyle]::Bold)
+                    $textBrush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(255, 0, 85, 185))
+                    $padBrush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(205, 255, 255, 255))
                     try {
-                        $pen = New-Object System.Drawing.Pen ([System.Drawing.Color]::Red), 3
-                        $g2.DrawEllipse($pen, $cx - 14, $cy - 14, 28, 28)
-                        $g2.DrawLine($pen, $cx - 22, $cy, $cx + 22, $cy)
-                        $g2.DrawLine($pen, $cx, $cy - 22, $cx, $cy + 22)
-                        $pen.Dispose()
+                        for ($gx = 0; $gx -lt $width; $gx += $gridStep) {
+                            $px = [int][Math]::Round($gx * $scale)
+                            if ($px -le 0 -or $px -ge $outW) { continue }
+                            $g2.DrawLine($linePen, $px, 0, $px, $outH)
+                            $label = "x=$($x + $gx)"
+                            $sz = $g2.MeasureString($label, $font)
+                            $g2.FillRectangle($padBrush, [float]($px + 1), [float]1, $sz.Width, $sz.Height)
+                            $g2.DrawString($label, $font, $textBrush, [float]($px + 1), [float]1)
+                        }
+                        for ($gy = 0; $gy -lt $height; $gy += $gridStep) {
+                            $py = [int][Math]::Round($gy * $scale)
+                            if ($py -le 0 -or $py -ge $outH) { continue }
+                            $g2.DrawLine($linePen, 0, $py, $outW, $py)
+                            $label = "y=$($y + $gy)"
+                            $sz = $g2.MeasureString($label, $font)
+                            $g2.FillRectangle($padBrush, [float]1, [float]($py + 1), $sz.Width, $sz.Height)
+                            $g2.DrawString($label, $font, $textBrush, [float]1, [float]($py + 1))
+                        }
                     }
-                    finally { $g2.Dispose() }
+                    finally {
+                        $linePen.Dispose(); $font.Dispose(); $textBrush.Dispose(); $padBrush.Dispose()
+                    }
+                }
+
+                # ---- 光标标记（位置同样按 scale 映射）----
+                if ($opt.ContainsKey('cursor')) {
+                    $pt = [GuiNative]::Cursor()
+                    $cx = [int][Math]::Round(($pt.X - $x) * $scale)
+                    $cy = [int][Math]::Round(($pt.Y - $y) * $scale)
+                    if ($cx -ge 0 -and $cy -ge 0 -and $cx -lt $outW -and $cy -lt $outH) {
+                        $pen = New-Object System.Drawing.Pen ([System.Drawing.Color]::Red), 3
+                        try {
+                            $g2.DrawEllipse($pen, $cx - 14, $cy - 14, 28, 28)
+                            $g2.DrawLine($pen, $cx - 22, $cy, $cx + 22, $cy)
+                            $g2.DrawLine($pen, $cx, $cy - 22, $cx, $cy + 22)
+                        }
+                        finally { $pen.Dispose() }
+                    }
                 }
             }
+            finally { $g2.Dispose() }
 
             $bmp.Save($out, [System.Drawing.Imaging.ImageFormat]::Png)
         }
         finally { $bmp.Dispose() }
 
         [pscustomobject]@{
-            path   = $out
-            x      = $x
-            y      = $y
-            width  = $width
-            height = $height
-            bytes  = (Get-Item $out).Length
+            path       = $out
+            x          = $x
+            y          = $y
+            width      = $outW
+            height     = $outH
+            physWidth  = $width
+            physHeight = $height
+            scale      = [Math]::Round($scale, 4)
+            gridStep   = $gridStep
+            bytes      = (Get-Item $out).Length
         } | ConvertTo-Json -Compress
     }
 
@@ -438,6 +615,47 @@ switch ($cmd) {
     }
 
     'click' {
+        # ---- 按控件名称点击：UIA 定位中心，不用模型算坐标 ----
+        if ($opt.ContainsKey('uia')) {
+            Initialize-Uia
+            $needle = [string]$opt['uia']
+            $hwnd = [IntPtr]::Zero
+            if ($opt.ContainsKey('hwnd')) { $hwnd = [IntPtr]([long]$opt['hwnd']) }
+            elseif ($opt.ContainsKey('window')) { $hwnd = [GuiNative]::FindWindow([string]$opt['window']) }
+            else { $hwnd = [GuiNative]::GetForegroundWindow() }
+            if ($hwnd -eq [IntPtr]::Zero) { throw 'click -uia: 找不到目标窗口' }
+
+            $rows = [UiaNative]::Walk($hwnd, 600, 12)
+            $hit = $null
+            foreach ($row in $rows) {
+                if (-not $row.Enabled) { continue }
+                if (($row.Name -like "*$needle*") -or ($row.Id -like "*$needle*")) { $hit = $row; break }
+            }
+            if ($null -eq $hit) { throw "click -uia: 没找到控件 ""$needle""（先跑 elements 看有哪些）" }
+
+            $cx = [int]($hit.X + [Math]::Floor($hit.W / 2))
+            $cy = [int]($hit.Y + [Math]::Floor($hit.H / 2))
+            $invoked = $false
+            if ($opt.ContainsKey('invoke')) { $invoked = [UiaNative]::InvokeAt($cx, $cy) }
+            if (-not $invoked) {
+                [void][GuiNative]::MoveTo($cx, $cy)
+                Start-Sleep -Milliseconds 60
+                [GuiNative]::MouseButton('left', $true)
+                Start-Sleep -Milliseconds 40
+                [GuiNative]::MouseButton('left', $false)
+            }
+            [pscustomobject]@{
+                ok      = $true
+                uia     = $needle
+                found   = $hit.Name
+                type    = $hit.Type
+                x       = $cx
+                y       = $cy
+                invoked = $invoked
+            } | ConvertTo-Json -Compress
+            break
+        }
+
         if ($rest.Count -ge 2) {
             [GuiNative]::MoveTo([int]$rest[0], [int]$rest[1])
             Start-Sleep -Milliseconds 60
@@ -565,9 +783,194 @@ switch ($cmd) {
         "waited $ms ms"
     }
 
+    'elements' {
+        Initialize-Uia
+        $hwnd = [IntPtr]::Zero
+        if ($opt.ContainsKey('hwnd')) { $hwnd = [IntPtr]([long]$opt['hwnd']) }
+        elseif ($opt.ContainsKey('window')) { $hwnd = [GuiNative]::FindWindow([string]$opt['window']) }
+        else { $hwnd = [GuiNative]::GetForegroundWindow() }
+        if ($hwnd -eq [IntPtr]::Zero) { throw 'elements: 找不到目标窗口' }
+
+        $maxNodes = if ($opt.ContainsKey('maxnodes')) { [int]$opt['maxnodes'] } else { 220 }
+        $maxDepth = if ($opt.ContainsKey('depth')) { [int]$opt['depth'] } else { 9 }
+        $needle = if ($opt.ContainsKey('filter')) { [string]$opt['filter'] } else { '' }
+
+        $sb = New-Object System.Text.StringBuilder 512
+        [void][GuiNative]::GetWindowText($hwnd, $sb, 512)
+        $l = 0; $t = 0; $w = 0; $h = 0
+        [void][GuiNative]::GetRect($hwnd, [ref]$l, [ref]$t, [ref]$w, [ref]$h)
+
+        $rows = [UiaNative]::Walk($hwnd, $maxNodes, $maxDepth)
+        $showAll = $opt.ContainsKey('all')
+        $kept = @()
+        foreach ($row in $rows) {
+            if ($needle) {
+                if (($row.Name -notlike "*$needle*") -and ($row.Id -notlike "*$needle*")) { continue }
+            }
+            elseif (-not $showAll -and $row.Name -eq '' -and $row.Id -eq '') { continue }
+            $kept += $row
+        }
+
+        "# window: {0} | hwnd=0x{1:X} | {2}x{3} at {4},{5} | nodes={6}" -f $sb.ToString(), $hwnd.ToInt64(), $w, $h, $l, $t, $kept.Count
+        "# columns: centerX,centerY,width,height | ControlType | Name | AutomationId | flags"
+        foreach ($row in $kept) {
+            $flags = @()
+            if ($row.Invokable) { $flags += 'invoke' }
+            if (-not $row.Enabled) { $flags += 'disabled' }
+            $cx = [int]($row.X + [Math]::Floor($row.W / 2))
+            $cy = [int]($row.Y + [Math]::Floor($row.H / 2))
+            $clean = (($row.Name -replace '[|\r\n\t]+', '/')).Trim()
+            "{0},{1},{2},{3}|{4}|{5}|{6}|{7}" -f $cx, $cy, $row.W, $row.H, $row.Type, $clean, $row.Id, ($flags -join ',')
+        }
+    }
+
+    'ocr' {
+        $path = if ($rest.Count -ge 1) { [string]$rest[0] } else { throw 'ocr 需要图片路径' }
+        if (-not [System.IO.Path]::IsPathRooted($path)) { $path = Join-Path (Get-Location).Path $path }
+        $path = [System.IO.Path]::GetFullPath($path)
+        if (-not (Test-Path $path)) { throw "找不到图片: $path" }
+
+        $needle = if ($opt.ContainsKey('filter')) { [string]$opt['filter'] } else { '' }
+
+        # Windows OCR 对 12px 左右的 UI 小字识别很差；放大 2x 后显著变好，坐标再除回来。
+        $zoom = if ($opt.ContainsKey('zoom')) { [double]$opt['zoom'] } else { 2.0 }
+        if ($zoom -lt 1.0) { $zoom = 1.0 }
+        if ($zoom -gt 4.0) { $zoom = 4.0 }
+        $ocrSource = $path
+        $zoomTemp = $null
+        if ($zoom -ne 1.0) {
+            Add-Type -AssemblyName System.Drawing
+            $img = [System.Drawing.Image]::FromFile($path)
+            try {
+                $zw = [int][Math]::Max(1, [Math]::Round($img.Width * $zoom))
+                $zh = [int][Math]::Max(1, [Math]::Round($img.Height * $zoom))
+                $zb = New-Object System.Drawing.Bitmap $zw, $zh
+                try {
+                    $zg = [System.Drawing.Graphics]::FromImage($zb)
+                    try {
+                        $zg.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+                        $zg.DrawImage($img, 0, 0, $zw, $zh)
+                    }
+                    finally { $zg.Dispose() }
+                    $zoomTemp = [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($path), '__ocr_zoom_' + [Guid]::NewGuid().ToString('N') + '.png')
+                    $zb.Save($zoomTemp, [System.Drawing.Imaging.ImageFormat]::Png)
+                }
+                finally { $zb.Dispose() }
+            }
+            finally { $img.Dispose() }
+            $ocrSource = $zoomTemp
+        }
+
+        Add-Type -AssemblyName System.Runtime.WindowsRuntime
+        $null = [Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType = WindowsRuntime]
+        $null = [Windows.Media.Ocr.OcrResult, Windows.Foundation, ContentType = WindowsRuntime]
+        $null = [Windows.Graphics.Imaging.BitmapDecoder, Windows.Foundation, ContentType = WindowsRuntime]
+        $null = [Windows.Graphics.Imaging.SoftwareBitmap, Windows.Foundation, ContentType = WindowsRuntime]
+        $null = [Windows.Storage.StorageFile, Windows.Foundation, ContentType = WindowsRuntime]
+        $null = [Windows.Storage.Streams.IRandomAccessStream, Windows.Foundation, ContentType = WindowsRuntime]
+
+        $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+                $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and
+                $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+        function Await-Op($op, [Type]$type) {
+            if ($null -eq $op) { throw "ocr: 空的异步句柄（$type）" }
+            $m = $asTaskGeneric.MakeGenericMethod($type)
+            $task = $m.Invoke($null, @($op))
+            try {
+                [void]$task.Wait(-1)
+            }
+            catch {
+                $e = $_.Exception
+                while ($e.InnerException) { $e = $e.InnerException }
+                throw "ocr: $($type.Name) 失败 - $($e.Message) [$($e.GetType().Name)]"
+            }
+            $task.Result
+        }
+
+        $result = $null
+        try {
+            $file = Await-Op ([Windows.Storage.StorageFile]::GetFileFromPathAsync($ocrSource)) ([Windows.Storage.StorageFile])
+            $stream = Await-Op ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
+            try {
+                $decoder = Await-Op ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
+                $bitmap = Await-Op ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+                $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
+                if ($null -eq $engine) { throw 'ocr: 本机没有可用的 OCR 语言包（设置 → 时间和语言 → 语言 → 该语言的“光学字符识别”可选功能）' }
+                $result = Await-Op ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
+            }
+            finally { $stream.Dispose() }
+        }
+        finally {
+            if ($zoomTemp) { Remove-Item -LiteralPath $zoomTemp -Force -ErrorAction SilentlyContinue }
+        }
+
+        "# ocr: {0} | {1} lines | lang={2} | zoom={3} | coords are screen pixels" -f $path, @($result.Lines).Count, $engine.RecognizerLanguage.LanguageTag, $zoom
+        "# columns: centerX,centerY,width,height | text"
+        foreach ($line in $result.Lines) {
+            $txt = $line.Text
+            # Windows OCR 会在汉字之间插空格；先去掉，再做过滤和输出（匹配更容易，也省 token）
+            $txt = $txt -replace '(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])', ''
+            if ($needle -and $txt -notlike "*$needle*") { continue }
+            $minX = [double]::MaxValue; $minY = [double]::MaxValue
+            $maxX = 0.0; $maxY = 0.0
+            foreach ($word in $line.Words) {
+                $r = $word.BoundingRect
+                if ($r.X -lt $minX) { $minX = $r.X }
+                if ($r.Y -lt $minY) { $minY = $r.Y }
+                if (($r.X + $r.Width) -gt $maxX) { $maxX = $r.X + $r.Width }
+                if (($r.Y + $r.Height) -gt $maxY) { $maxY = $r.Y + $r.Height }
+            }
+            if ($maxX -le 0) { continue }
+            $cx = [int][Math]::Round((($minX + $maxX) / 2.0) / $zoom)
+            $cy = [int][Math]::Round((($minY + $maxY) / 2.0) / $zoom)
+            $bw = [int][Math]::Round(($maxX - $minX) / $zoom)
+            $bh = [int][Math]::Round(($maxY - $minY) / $zoom)
+            "{0},{1},{2},{3}|{4}" -f $cx, $cy, $bw, $bh, $txt
+        }
+    }
+
+    'seq' {
+        $file = if ($opt.ContainsKey('file')) { [string]$opt['file'] } else { throw 'seq 需要 -file ops.json' }
+        if (-not [System.IO.Path]::IsPathRooted($file)) { $file = Join-Path (Get-Location).Path $file }
+        if (-not (Test-Path $file)) { throw "找不到 ops 文件: $file" }
+
+        $ops = Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($ops -isnot [System.Array]) { $ops = @($ops) }
+        $defaultDelay = if ($opt.ContainsKey('delay')) { [int]$opt['delay'] } else { 60 }
+
+        $i = 0
+        foreach ($op in $ops) {
+            $i++
+            $subCmd = [string]$op.cmd
+            $subRest = @()
+            if ($null -ne $op.rest) { $subRest = @($op.rest | ForEach-Object { [string]$_ }) }
+            $subOpt = @{}
+            if ($null -ne $op.opt) {
+                foreach ($p in $op.opt.PSObject.Properties) { $subOpt[$p.Name.ToLowerInvariant()] = $p.Value }
+            }
+            try {
+                $r = Invoke-GuiCmd $subCmd $subRest $subOpt
+                $text = ($r | Out-String).Trim()
+                "[$i] $subCmd ok"
+                if ($text) { $text }
+            }
+            catch {
+                "[$i] $subCmd FAILED: $($_.Exception.Message)"
+                break
+            }
+            if ($i -lt $ops.Count) {
+                $ms = if ($op.delayMs) { [int]$op.delayMs } else { $defaultDelay }
+                if ($ms -gt 0) { Start-Sleep -Milliseconds $ms }
+            }
+        }
+    }
+
     default {
         Write-Host "未知命令: $cmd"
-        Write-Host "可用: windows | pos | shot | activate | move | click | drag | scroll | type | key | wait"
+        Write-Host "可用: windows | pos | fg | shot | elements | ocr | seq | activate | move | click | drag | scroll | type | key | wait"
         exit 1
     }
 }
+}
+
+Invoke-GuiCmd $cmd $rest $opt
