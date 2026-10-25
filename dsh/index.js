@@ -492,17 +492,19 @@ export function apply(ctx, userConfig = {}) {
         }
         const isShot = typeof parsed.path === 'string'
         if (args.action === 'screenshot') pruneShots(config)
-        return {
-          ok: true,
-          action: args.action,
-          imagePath: isShot ? parsed.path : undefined,
-          width: typeof parsed.width === 'number' ? parsed.width : undefined,
-          height: typeof parsed.height === 'number' ? parsed.height : undefined,
-          scale: typeof parsed.scale === 'number' ? parsed.scale : undefined,
-          gridStep: typeof parsed.gridStep === 'number' ? parsed.gridStep : undefined,
+        // Build the result without `undefined` fields: the host requires lossless JSON.
+        const result = { ok: true, action: args.action }
+        if (isShot) {
+          result.imagePath = parsed.path
+          if (typeof parsed.width === 'number') result.width = parsed.width
+          if (typeof parsed.height === 'number') result.height = parsed.height
+          if (typeof parsed.scale === 'number') result.scale = parsed.scale
+          if (typeof parsed.gridStep === 'number') result.gridStep = parsed.gridStep
+        } else {
           // Non-screenshot JSON (e.g. click by UIA name) is small: pass it through verbatim.
-          output: isShot ? undefined : stdout,
+          result.output = stdout
         }
+        return result
       }
 
       let output = stdout
