@@ -6,17 +6,41 @@ import { buildArgs } from '../dsh/index.js'
 const CFG = {
   screenshotDir: 'C:\\shots',
   screenshotMaxWidth: 1440,
-  screenshotGrid: true,
+  screenshotGrid: false,
   screenshotCursor: true,
 }
 
-// screenshot: absolute .png path + grid + cursor + max-width by default.
+// screenshot: absolute .png path + cursor; the grid is opt-in (its labels are read
+// as text by OCR/vision-to-text engines and cost tokens).
 {
   const { argv, json } = buildArgs({ action: 'screenshot' }, CFG)
   assert.equal(argv[0], 'shot')
   assert.match(argv[1], /C:\\shots\\shot-\d{8}-\d{6}-\d{3}\.png$/)
-  assert.deepEqual(argv.slice(2), ['-grid', '-cursor', '-maxwidth', '1440'])
+  assert.deepEqual(argv.slice(2), ['-cursor', '-maxwidth', '1440'])
   assert.equal(json, true)
+}
+
+// grid:true turns the coordinate grid on.
+{
+  const { argv } = buildArgs({ action: 'screenshot', grid: true }, CFG)
+  assert.ok(argv.includes('-grid'))
+}
+
+// find: local OCR lookup, optionally clicking the hit.
+{
+  assert.deepEqual(buildArgs({ action: 'find', text: '保存' }).argv, ['find', '保存'])
+  assert.deepEqual(
+    buildArgs({ action: 'find', text: '保存', window: '记事本', threshold: 0.4, click: true }).argv,
+    ['find', '保存', '-window', '记事本', '-threshold', '0.4', '-click'],
+  )
+  assert.deepEqual(buildArgs({ action: 'find', text: '插入', screen: true, button: 'right' }).argv, [
+    'find',
+    '插入',
+    '-screen',
+    '-button',
+    'right',
+  ])
+  assert.throws(() => buildArgs({ action: 'find' }), /requires a non-empty "text"/)
 }
 
 // screenshot: everything can be switched off, and window/region/print still pass through.

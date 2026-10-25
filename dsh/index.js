@@ -50,8 +50,9 @@ const DEFAULTS = {
   screenshotDir: SHOT_DIR,
   // Long edge cap for screenshots. 0 disables scaling (image keeps 1:1 pixels).
   screenshotMaxWidth: 1440,
-  // Stamp the labelled coordinate grid on every screenshot.
-  screenshotGrid: true,
+  // Stamp the labelled coordinate grid. Off by default: grid labels get picked up
+  // by OCR/vision-to-text engines and add tokens. Turn on when reading the image directly.
+  screenshotGrid: false,
   // Stamp the cursor crosshair on every screenshot.
   screenshotCursor: true,
   // Keep at most this many PNGs; older ones are pruned after a new shot.
@@ -64,6 +65,7 @@ const ACTIONS = [
   'screenshot',
   'windows',
   'elements',
+  'find',
   'ocr',
   'click',
   'move',
@@ -87,13 +89,13 @@ const PARAMETERS = {
       type: 'string',
       enum: ACTIONS,
       description:
-        'screenshot (save a PNG and return its path), windows (list visible windows), elements (UIA control list for a window: name + centre point, no image needed), ocr (local OCR of an image: text + boxes), click, move, drag, scroll, type (paste text), key (press a combo such as ctrl+s), activate (bring a window to front), pos (cursor position), wait, sequence (run several actions in one call).',
+        'screenshot (save a PNG and return its path), windows (list visible windows), elements (UIA control list for a window: name + centre point, no image needed), find (locate text on screen with local OCR and return its exact coordinates — cheapest way to hit a labelled button), ocr (local OCR of an image: text + boxes), click, move, drag, scroll, type (paste text), key (press a combo such as ctrl+s), activate (bring a window to front), pos (cursor position), wait, sequence (run several actions in one call).',
     },
     x: { type: 'number', description: 'Target X in physical screen pixels.' },
     y: { type: 'number', description: 'Target Y in physical screen pixels.' },
     x2: { type: 'number', description: 'Drag end X.' },
     y2: { type: 'number', description: 'Drag end Y.' },
-    text: { type: 'string', description: 'Text for action=type. Unicode is fine; it is pasted via the clipboard.' },
+    text: { type: 'string', description: 'Text for action=type, or the on-screen label to look for in action=find. Unicode is fine.' },
     key: { type: 'string', description: 'Combo for action=key, e.g. "ctrl+s", "alt+f4", "enter".' },
     window: {
       type: 'string',
@@ -131,6 +133,19 @@ const PARAMETERS = {
     all: {
       type: 'boolean',
       description: 'elements: also keep unnamed container rows and skip row truncation.',
+    },
+    threshold: {
+      type: 'number',
+      description: 'find: minimum match score 0-1 (default 0.55). Lower it when OCR mangles the label.',
+    },
+    click: {
+      type: 'boolean',
+      description: 'find: click the best match immediately, saving a round-trip.',
+    },
+    screen: {
+      type: 'boolean',
+      description:
+        'find: capture the real screen instead of the window bitmap. Use when the window is in the foreground and the app renders on the GPU.',
     },
     uia: {
       type: 'string',
@@ -262,6 +277,16 @@ export function buildArgs(args, config = DEFAULTS) {
       if (typeof args.filter === 'string' && args.filter.length > 0) argv.push('-filter', args.filter)
       if (typeof args.depth === 'number' && args.depth > 0) argv.push('-depth', String(Math.round(args.depth)))
       if (args.all === true) argv.push('-all')
+      return { argv, json: false }
+    }
+    case 'find': {
+      const argv = ['find', requireString(args, 'text')]
+      if (typeof args.window === 'string' && args.window.length > 0) argv.push('-window', args.window)
+      if (typeof args.region === 'string' && args.region.length > 0) argv.push('-region', args.region)
+      if (typeof args.threshold === 'number') argv.push('-threshold', String(args.threshold))
+      if (args.click === true) argv.push('-click')
+      if (args.screen === true) argv.push('-screen')
+      if (args.button !== undefined) argv.push('-button', String(args.button))
       return { argv, json: false }
     }
     case 'ocr': {
@@ -429,7 +454,7 @@ export function apply(ctx, userConfig = {}) {
   ctx.tools.register({
     name: 'desktop',
     description:
-      'See and control the Windows desktop. Cheapest-first: action=elements (UIA control names + centre points, no image) and action=windows beat screenshots. action=screenshot saves a PNG stamped with a labelled coordinate grid + cursor and returns its absolute path — read the grid labels, they are screen pixels; if the reply mentions a scale factor, convert with it. Local action=ocr reads text + boxes without any network/quota. Use action=sequence to chain several actions in ONE call (much cheaper than one call per action). Coordinates are physical pixels. Typical loop: elements -> click uia -> screenshot only to verify. Use it only when a task truly has no CLI or API path.',
+      'See and control the Windows desktop. Cheapest first: action=find locates on-screen text with local OCR and returns its exact coordinates (~30 tokens, no image, no network) — add click:true to hit it in the same call; action=elements gives UIA names + centre points for native controls; action=windows lists windows. Only then consider action=screenshot, which saves a PNG (cursor crosshair stamped, optional grid) and returns its path plus any scale factor — read grid labels as screen pixels, and if a scale is mentioned, convert with it. action=ocr dumps text + boxes from an image. Use action=sequence to chain several actions in ONE call — much cheaper than one call per action. Coordinates are physical pixels. Typical loop: find -> click (or find click:true) -> screenshot only to verify. Use it only when a task truly has no CLI or API path.',
     parameters: PARAMETERS,
     output: {
       schema: OUTPUT,

@@ -426,6 +426,171 @@ function Get-RectFromString([string]$s) {
     @{ X = [int]$p[0]; Y = [int]$p[1]; W = [int]$p[2]; H = [int]$p[3] }
 }
 
+# ---- 快速原图截图（find 用；不带网格/缩放，避免污染 OCR）----
+function Save-QuickShot {
+    param([IntPtr]$Hwnd, $Region, [string]$Out, [switch]$Print)
+
+    if ($Hwnd -ne [IntPtr]::Zero) {
+        $l = 0; $t = 0; $w = 0; $h = 0
+        if (-not [GuiNative]::GetRect($Hwnd, [ref]$l, [ref]$t, [ref]$w, [ref]$h)) { throw '拿不到窗口矩形' }
+    }
+    elseif ($null -ne $Region) {
+        $l = $Region.X; $t = $Region.Y; $w = $Region.W; $h = $Region.H
+    }
+    else {
+        $l = [GuiNative]::GetSystemMetrics(76); $t = [GuiNative]::GetSystemMetrics(77)
+        $w = [GuiNative]::GetSystemMetrics(78); $h = [GuiNative]::GetSystemMetrics(79)
+    }
+    if ($w -le 0 -or $h -le 0) { throw "截图区域无效: ${w}x${h}" }
+
+    $bmp = New-Object System.Drawing.Bitmap $w, $h
+    try {
+        $g = [System.Drawing.Graphics]::FromImage($bmp)
+        try {
+            if ($Print -and $Hwnd -ne [IntPtr]::Zero) {
+                # PrintWindow 不受遮挡影响；Electron/Chromium 窗口也能截到内容
+                $hdc = $g.GetHdc()
+                try { [void][GuiNative]::PrintWindow($Hwnd, $hdc, 2) }
+                finally { $g.ReleaseHdc($hdc) }
+            }
+            else {
+                $g.CopyFromScreen($l, $t, 0, 0, (New-Object System.Drawing.Size $w, $h))
+            }
+        }
+        finally { $g.Dispose() }
+        $bmp.Save($Out, [System.Drawing.Imaging.ImageFormat]::Png)
+    }
+    finally { $bmp.Dispose() }
+
+    [pscustomobject]@{ X = $l; Y = $t; W = $w; H = $h }
+}
+
+# ---- 本地 OCR（Windows.Media.Ocr）：ocr 与 find 共用 ----
+function Invoke-OcrFile {
+    param([string]$Path, [double]$Zoom = 2.0, [string]$Filter = '')
+
+    $path = [System.IO.Path]::GetFullPath($Path)
+    if (-not (Test-Path $path)) { throw "找不到图片: $path" }
+    if ($Zoom -lt 1.0) { $Zoom = 1.0 }
+    if ($Zoom -gt 4.0) { $Zoom = 4.0 }
+
+    $src = $path
+    $zoomTemp = $null
+    if ($Zoom -ne 1.0) {
+        Add-Type -AssemblyName System.Drawing
+        $img = [System.Drawing.Image]::FromFile($path)
+        try {
+            $zw = [int][Math]::Max(1, [Math]::Round($img.Width * $Zoom))
+            $zh = [int][Math]::Max(1, [Math]::Round($img.Height * $Zoom))
+            $zb = New-Object System.Drawing.Bitmap $zw, $zh
+            try {
+                $zg = [System.Drawing.Graphics]::FromImage($zb)
+                try {
+                    $zg.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+                    $zg.DrawImage($img, 0, 0, $zw, $zh)
+                }
+                finally { $zg.Dispose() }
+                $zoomTemp = [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($path), '__ocr_zoom_' + [Guid]::NewGuid().ToString('N') + '.png')
+                $zb.Save($zoomTemp, [System.Drawing.Imaging.ImageFormat]::Png)
+            }
+            finally { $zb.Dispose() }
+        }
+        finally { $img.Dispose() }
+        $src = $zoomTemp
+    }
+
+    Add-Type -AssemblyName System.Runtime.WindowsRuntime
+    $null = [Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType = WindowsRuntime]
+    $null = [Windows.Media.Ocr.OcrResult, Windows.Foundation, ContentType = WindowsRuntime]
+    $null = [Windows.Graphics.Imaging.BitmapDecoder, Windows.Foundation, ContentType = WindowsRuntime]
+    $null = [Windows.Graphics.Imaging.SoftwareBitmap, Windows.Foundation, ContentType = WindowsRuntime]
+    $null = [Windows.Storage.StorageFile, Windows.Foundation, ContentType = WindowsRuntime]
+    $null = [Windows.Storage.Streams.IRandomAccessStream, Windows.Foundation, ContentType = WindowsRuntime]
+
+    $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+            $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and
+            $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+    function Await-Op($op, [Type]$type) {
+        if ($null -eq $op) { throw "ocr: 空的异步句柄（$type）" }
+        $m = $asTaskGeneric.MakeGenericMethod($type)
+        $task = $m.Invoke($null, @($op))
+        try { [void]$task.Wait(-1) }
+        catch {
+            $e = $_.Exception
+            while ($e.InnerException) { $e = $e.InnerException }
+            throw "ocr: $($type.Name) 失败 - $($e.Message) [$($e.GetType().Name)]"
+        }
+        $task.Result
+    }
+
+    $result = $null
+    try {
+        $file = Await-Op ([Windows.Storage.StorageFile]::GetFileFromPathAsync($src)) ([Windows.Storage.StorageFile])
+        $stream = Await-Op ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
+        try {
+            $decoder = Await-Op ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
+            $bitmap = Await-Op ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+            $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
+            if ($null -eq $engine) { throw 'ocr: 本机没有可用的 OCR 语言包（设置 → 时间和语言 → 语言 → 该语言的“光学字符识别”可选功能）' }
+            $result = Await-Op ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
+        }
+        finally { $stream.Dispose() }
+    }
+    finally {
+        if ($zoomTemp) { Remove-Item -LiteralPath $zoomTemp -Force -ErrorAction SilentlyContinue }
+    }
+
+    $rows = @()
+    foreach ($line in $result.Lines) {
+        $txt = $line.Text
+        # Windows OCR 会在汉字之间插空格；先去掉，再做过滤和输出
+        $txt = $txt -replace '(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])', ''
+        if ($Filter -and $txt -notlike "*$Filter*") { continue }
+        $minX = [double]::MaxValue; $minY = [double]::MaxValue
+        $maxX = 0.0; $maxY = 0.0
+        foreach ($word in $line.Words) {
+            $r = $word.BoundingRect
+            if ($r.X -lt $minX) { $minX = $r.X }
+            if ($r.Y -lt $minY) { $minY = $r.Y }
+            if (($r.X + $r.Width) -gt $maxX) { $maxX = $r.X + $r.Width }
+            if (($r.Y + $r.Height) -gt $maxY) { $maxY = $r.Y + $r.Height }
+        }
+        if ($maxX -le 0) { continue }
+        $rows += [pscustomobject]@{
+            X    = [int][Math]::Round((($minX + $maxX) / 2.0) / $Zoom)
+            Y    = [int][Math]::Round((($minY + $maxY) / 2.0) / $Zoom)
+            W    = [int][Math]::Round(($maxX - $minX) / $Zoom)
+            H    = [int][Math]::Round(($maxY - $minY) / $Zoom)
+            Text = $txt
+        }
+    }
+
+    [pscustomobject]@{
+        Rows      = $rows
+        Zoom      = $Zoom
+        Lang      = $engine.RecognizerLanguage.LanguageTag
+        LineCount = @($result.Lines).Count
+    }
+}
+
+# ---- 文字相似度：OCR 会错字，靠包含关系 + 字符重叠兜底 ----
+function Get-MatchScore {
+    param([string]$Candidate, [string]$Needle)
+
+    $a = $Candidate.ToLowerInvariant().Trim()
+    $b = $Needle.ToLowerInvariant().Trim()
+    if ($a.Length -eq 0 -or $b.Length -eq 0) { return 0.0 }
+    if ($a -eq $b) { return 1.0 }
+    if ($a.Contains($b)) { return 0.92 }
+    if ($b.Contains($a)) { return 0.78 }
+
+    $set = New-Object 'System.Collections.Generic.HashSet[char]'
+    foreach ($ch in $b.ToCharArray()) { [void]$set.Add($ch) }
+    $hit = 0
+    foreach ($ch in $a.ToCharArray()) { if ($set.Contains($ch)) { $hit++ } }
+    [Math]::Min(0.7, $hit / [double][Math]::Max($a.Length, $b.Length))
+}
+
 function Invoke-GuiCmd {
     param($cmd, $rest, $opt)
 
@@ -466,6 +631,10 @@ switch ($cmd) {
         $hwnd = [IntPtr]::Zero
         if ($opt.ContainsKey('window')) { $hwnd = [GuiNative]::FindWindow([string]$opt['window']) }
         elseif ($opt.ContainsKey('hwnd')) { $hwnd = [IntPtr]([long]$opt['hwnd']) }
+
+        # 指定了窗口却找不到时直接报错，绝不静默退回全屏（那会截到别的窗口，模型按错坐标点）
+        if ($opt.ContainsKey('window') -and $hwnd -eq [IntPtr]::Zero) { throw "shot: 找不到窗口 ""$($opt['window'])""" }
+        if ($hwnd -ne [IntPtr]::Zero -and [GuiNative]::IsIconic($hwnd)) { throw 'shot: 目标窗口已最小化，先用 activate 还原' }
 
         if ($hwnd -ne [IntPtr]::Zero) {
             $l = 0; $t = 0; $w = 0; $h = 0
@@ -790,6 +959,7 @@ switch ($cmd) {
         elseif ($opt.ContainsKey('window')) { $hwnd = [GuiNative]::FindWindow([string]$opt['window']) }
         else { $hwnd = [GuiNative]::GetForegroundWindow() }
         if ($hwnd -eq [IntPtr]::Zero) { throw 'elements: 找不到目标窗口' }
+        if ([GuiNative]::IsIconic($hwnd)) { throw 'elements: 目标窗口已最小化，先用 activate 还原' }
 
         $maxNodes = if ($opt.ContainsKey('maxnodes')) { [int]$opt['maxnodes'] } else { 220 }
         $maxDepth = if ($opt.ContainsKey('depth')) { [int]$opt['depth'] } else { 9 }
@@ -831,101 +1001,93 @@ switch ($cmd) {
         if (-not (Test-Path $path)) { throw "找不到图片: $path" }
 
         $needle = if ($opt.ContainsKey('filter')) { [string]$opt['filter'] } else { '' }
-
-        # Windows OCR 对 12px 左右的 UI 小字识别很差；放大 2x 后显著变好，坐标再除回来。
         $zoom = if ($opt.ContainsKey('zoom')) { [double]$opt['zoom'] } else { 2.0 }
-        if ($zoom -lt 1.0) { $zoom = 1.0 }
-        if ($zoom -gt 4.0) { $zoom = 4.0 }
-        $ocrSource = $path
-        $zoomTemp = $null
-        if ($zoom -ne 1.0) {
-            Add-Type -AssemblyName System.Drawing
-            $img = [System.Drawing.Image]::FromFile($path)
-            try {
-                $zw = [int][Math]::Max(1, [Math]::Round($img.Width * $zoom))
-                $zh = [int][Math]::Max(1, [Math]::Round($img.Height * $zoom))
-                $zb = New-Object System.Drawing.Bitmap $zw, $zh
-                try {
-                    $zg = [System.Drawing.Graphics]::FromImage($zb)
-                    try {
-                        $zg.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
-                        $zg.DrawImage($img, 0, 0, $zw, $zh)
-                    }
-                    finally { $zg.Dispose() }
-                    $zoomTemp = [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($path), '__ocr_zoom_' + [Guid]::NewGuid().ToString('N') + '.png')
-                    $zb.Save($zoomTemp, [System.Drawing.Imaging.ImageFormat]::Png)
-                }
-                finally { $zb.Dispose() }
-            }
-            finally { $img.Dispose() }
-            $ocrSource = $zoomTemp
+
+        $ocr = Invoke-OcrFile -Path $path -Zoom $zoom -Filter $needle
+
+        "# ocr: {0} | {1} lines | lang={2} | zoom={3} | coords are screen pixels" -f $path, $ocr.LineCount, $ocr.Lang, $ocr.Zoom
+        "# columns: centerX,centerY,width,height | text"
+        foreach ($row in $ocr.Rows) {
+            "{0},{1},{2},{3}|{4}" -f $row.X, $row.Y, $row.W, $row.H, $row.Text
         }
+    }
 
-        Add-Type -AssemblyName System.Runtime.WindowsRuntime
-        $null = [Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType = WindowsRuntime]
-        $null = [Windows.Media.Ocr.OcrResult, Windows.Foundation, ContentType = WindowsRuntime]
-        $null = [Windows.Graphics.Imaging.BitmapDecoder, Windows.Foundation, ContentType = WindowsRuntime]
-        $null = [Windows.Graphics.Imaging.SoftwareBitmap, Windows.Foundation, ContentType = WindowsRuntime]
-        $null = [Windows.Storage.StorageFile, Windows.Foundation, ContentType = WindowsRuntime]
-        $null = [Windows.Storage.Streams.IRandomAccessStream, Windows.Foundation, ContentType = WindowsRuntime]
+    'find' {
+        # 本地 OCR 直接找文字并给出屏幕坐标：模型不必读整屏文字，token 从上千降到几十。
+        $needle = if ($rest.Count -ge 1) { [string]$rest[0] } else { throw 'find 需要要查找的文字，例如: find 保存' }
+        $zoom = if ($opt.ContainsKey('zoom')) { [double]$opt['zoom'] } else { 2.0 }
+        $threshold = if ($opt.ContainsKey('threshold')) { [double]$opt['threshold'] } else { 0.55 }
 
-        $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
-                $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and
-                $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
-        function Await-Op($op, [Type]$type) {
-            if ($null -eq $op) { throw "ocr: 空的异步句柄（$type）" }
-            $m = $asTaskGeneric.MakeGenericMethod($type)
-            $task = $m.Invoke($null, @($op))
-            try {
-                [void]$task.Wait(-1)
-            }
-            catch {
-                $e = $_.Exception
-                while ($e.InnerException) { $e = $e.InnerException }
-                throw "ocr: $($type.Name) 失败 - $($e.Message) [$($e.GetType().Name)]"
-            }
-            $task.Result
-        }
+        $hwnd = [IntPtr]::Zero
+        if ($opt.ContainsKey('window')) { $hwnd = [GuiNative]::FindWindow([string]$opt['window']) }
+        elseif ($opt.ContainsKey('hwnd')) { $hwnd = [IntPtr]([long]$opt['hwnd']) }
+        if ($opt.ContainsKey('window') -and $hwnd -eq [IntPtr]::Zero) { throw "find: 找不到窗口 ""$($opt['window'])""" }
+        if ($hwnd -ne [IntPtr]::Zero -and [GuiNative]::IsIconic($hwnd)) { throw 'find: 目标窗口已最小化，先用 activate 还原' }
+        $region = $null
+        if ($opt.ContainsKey('region')) { $region = Get-RectFromString ([string]$opt['region']) }
 
-        $result = $null
+        $tmp = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), 'dsh-find-' + [Guid]::NewGuid().ToString('N') + '.png')
+        $rect = $null
+        $ocr = $null
+        # 前台窗口直接截屏幕（真实像素，GPU 渲染的应用也能读到）；
+        # 只有被遮挡的窗口才用 PrintWindow —— 它对部分应用会返回空白图。
+        $fg = [GuiNative]::GetForegroundWindow()
+        $usePrint = ($hwnd -ne [IntPtr]::Zero) -and ($hwnd -ne $fg) -and ($null -eq $region) -and (-not $opt.ContainsKey('screen'))
         try {
-            $file = Await-Op ([Windows.Storage.StorageFile]::GetFileFromPathAsync($ocrSource)) ([Windows.Storage.StorageFile])
-            $stream = Await-Op ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
-            try {
-                $decoder = Await-Op ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
-                $bitmap = Await-Op ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
-                $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
-                if ($null -eq $engine) { throw 'ocr: 本机没有可用的 OCR 语言包（设置 → 时间和语言 → 语言 → 该语言的“光学字符识别”可选功能）' }
-                $result = Await-Op ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
-            }
-            finally { $stream.Dispose() }
+            $rect = Save-QuickShot -Hwnd $hwnd -Region $region -Out $tmp -Print:$usePrint
+            $ocr = Invoke-OcrFile -Path $tmp -Zoom $zoom
         }
         finally {
-            if ($zoomTemp) { Remove-Item -LiteralPath $zoomTemp -Force -ErrorAction SilentlyContinue }
+            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
         }
 
-        "# ocr: {0} | {1} lines | lang={2} | zoom={3} | coords are screen pixels" -f $path, @($result.Lines).Count, $engine.RecognizerLanguage.LanguageTag, $zoom
-        "# columns: centerX,centerY,width,height | text"
-        foreach ($line in $result.Lines) {
-            $txt = $line.Text
-            # Windows OCR 会在汉字之间插空格；先去掉，再做过滤和输出（匹配更容易，也省 token）
-            $txt = $txt -replace '(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])', ''
-            if ($needle -and $txt -notlike "*$needle*") { continue }
-            $minX = [double]::MaxValue; $minY = [double]::MaxValue
-            $maxX = 0.0; $maxY = 0.0
-            foreach ($word in $line.Words) {
-                $r = $word.BoundingRect
-                if ($r.X -lt $minX) { $minX = $r.X }
-                if ($r.Y -lt $minY) { $minY = $r.Y }
-                if (($r.X + $r.Width) -gt $maxX) { $maxX = $r.X + $r.Width }
-                if (($r.Y + $r.Height) -gt $maxY) { $maxY = $r.Y + $r.Height }
+        $all = @()
+        foreach ($row in $ocr.Rows) {
+            $all += [pscustomobject]@{
+                Score = (Get-MatchScore -Candidate $row.Text -Needle $needle)
+                X     = $rect.X + $row.X
+                Y     = $rect.Y + $row.Y
+                W     = $row.W
+                H     = $row.H
+                Text  = $row.Text
             }
-            if ($maxX -le 0) { continue }
-            $cx = [int][Math]::Round((($minX + $maxX) / 2.0) / $zoom)
-            $cy = [int][Math]::Round((($minY + $maxY) / 2.0) / $zoom)
-            $bw = [int][Math]::Round(($maxX - $minX) / $zoom)
-            $bh = [int][Math]::Round(($maxY - $minY) / $zoom)
-            "{0},{1},{2},{3}|{4}" -f $cx, $cy, $bw, $bh, $txt
+        }
+        $all = @($all | Sort-Object Score -Descending)
+        $scored = @($all | Where-Object { $_.Score -ge $threshold })
+
+        $scope = if ($hwnd -ne [IntPtr]::Zero) { 'window' } elseif ($null -ne $region) { 'region' } else { 'screen' }
+        "# find `"$needle`" | $scope $($rect.W)x$($rect.H) at $($rect.X),$($rect.Y) | $($ocr.LineCount) lines | matches=$($scored.Count)"
+        if ($scored.Count -eq 0) {
+            'notfound'
+            if ($ocr.LineCount -eq 0) {
+                if ($usePrint) { "# hint: 后台截图是空白（该应用不支持 PrintWindow），先 activate 把它提到前台再找" }
+                else { "# hint: 这一屏没有可识别文字（纯图形界面），改用 screenshot" }
+            }
+            # 未命中时给最接近的几行，模型据此换关键词，而不是再读一遍整屏
+            $n = 0
+            foreach ($m in $all) {
+                if ($n -ge 3) { break }
+                if ($m.Score -le 0.15) { break }
+                $n++
+                "closest|{0:N2}|{1},{2}|{3}" -f $m.Score, $m.X, $m.Y, $m.Text
+            }
+            return
+        }
+        $n = 0
+        foreach ($m in $scored) {
+            if ($n -ge 3) { break }
+            $n++
+            "{0},{1},{2},{3}|{4:N2}|{5}" -f $m.X, $m.Y, $m.W, $m.H, $m.Score, $m.Text
+        }
+        if ($opt.ContainsKey('click')) {
+            $best = $scored[0]
+            $button = if ($opt.ContainsKey('button')) { [string]$opt['button'] } else { 'left' }
+            [void][GuiNative]::MoveTo($best.X, $best.Y)
+            Start-Sleep -Milliseconds 60
+            [GuiNative]::MouseButton($button, $true)
+            Start-Sleep -Milliseconds 40
+            [GuiNative]::MouseButton($button, $false)
+            "clicked $button @ $($best.X),$($best.Y)"
         }
     }
 
